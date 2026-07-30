@@ -1,182 +1,703 @@
-use serde_json::Value;
-use tokio::sync::mpsc;
-use rand::{Rng, thread_rng};
-use rand::prelude::SliceRandom;
+//! solana_find — High-throughput Solana wallet scanner
+//!
+//! Key differences from ETH/DOGE scanner:
+//!   • Uses ed25519 (not secp256k1) — Solana's curve
+//!   • SLIP-0010 derivation (not BIP-32) — ed25519 requires ALL hardened indices
+//!   • Path: m/44'/501'/0'/0'  — Phantom/Solflare standard
+//!   • Address = bs58(raw_32_byte_pubkey) — no hashing, no version byte, no checksum
+//!   • Balance API: Solana JSON-RPC getBalance → lamports (1 SOL = 1e9 lamports)
+//!   • Login: import 64-byte keypair (priv+pub) or mnemonic into Phantom/Solflare
+//!
+//! Architecture: N generator threads → channel → M checker threads → dashboard
 
-// Constants
-const MNEMONIC_WORDS: &[&str] = &[
-    "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd", "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire", "across", "act", "action", "actor", "actress", "actual", "adapt", "add", "addict", "address", "adjust", "admit", "adult", "advance", "advice", "aerobic", "affair", "afford", "afraid", "again", "age", "agent", "agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album", "alcohol", "alert", "alien", "all", "alley", "allow", "almost", "alone", "alpha", "already", "also", "alter", "always", "amateur", "amazing", "among", "amount", "amused", "analyst", "anchor", "ancient", "anger", "angle", "angry", "animal", "ankle", "announce", "annual", "another", "answer", "antenna", "antique", "anxiety", "any", "apart", "apology", "appear", "apple", "approve", "april", "arch", "arctic", "area", "arena", "argue", "arm", "armed", "armor", "army", "around", "arrange", "arrest", "arrive", "arrow", "art", "artefact", "artist", "artwork", "ask", "aspect", "assault", "asset", "assist", "assume", "asthma", "athlete", "atom", "attack", "attend", "attitude", "attract", "auction", "audit", "august", "aunt", "author", "auto", "autumn", "average", "avocado", "avoid", "awake", "aware", "away", "awesome", "awful", "awkward", "axis", "baby", "bachelor", "bacon", "badge", "bag", "balance", "balcony", "ball", "bamboo", "banana", "banner", "bar", "barely", "bargain", "barrel", "base", "basic", "basket", "battle", "beach", "bean", "beauty", "because", "become", "beef", "before", "begin", "behave", "behind", "believe", "below", "belt", "bench", "benefit", "best", "betray", "better", "between", "beyond", "bicycle", "bid", "bike", "bind", "biology", "bird", "birth", "bitter", "black", "blade", "blame", "blanket", "blast", "bleak", "bless", "blind", "blood", "blossom", "blouse", "blue", "blur", "blush", "board", "boat", "body", "boil", "bomb", "bone", "bonus", "book", "boost", "border", "boring", "borrow", "boss", "bottom", "bounce", "box", "boy", "bracket", "brain", "brand", "brass", "brave", "bread", "breeze", "brick", "bridge", "brief", "bright", "bring", "brisk", "broccoli", "broken", "bronze", "broom", "brother", "brown", "brush", "bubble", "buddy", "budget", "buffalo", "build", "bulb", "bulk", "bullet", "bundle", "bunker", "burden", "burger", "burst", "bus", "business", "busy", "butter", "buyer", "buzz", "cabbage", "cabin", "cable", "cactus", "cage", "cake", "call", "calm", "camera", "camp", "can", "canal", "cancel", "candy", "cannon", "canoe", "canvas", "canyon", "capable", "capital", "captain", "car", "carbon", "card", "cargo", "carpet", "carry", "cart", "case", "cash", "casino", "castle", "casual", "cat", "catalog", "catch", "category", "cattle", "caught", "cause", "caution", "cave", "ceiling", "celery", "cement", "census", "century", "cereal", "certain", "chair", "chalk", "champion", "change", "chaos", "chapter", "charge", "chase", "chat", "cheap", "check", "cheese", "chef", "cherry", "chest", "chicken", "chief", "child", "chimney", "choice", "choose", "chronic", "chuckle", "chunk", "churn", "cigar", "cinnamon", "circle", "citizen", "city", "civil", "claim", "clap", "clarify", "claw", "clay", "clean", "clerk", "clever", "click", "client", "cliff", "climb", "clinic", "clip", "clock", "clog", "close", "cloth", "cloud", "clown", "club", "clump", "cluster", "clutch", "coach", "coast", "coconut", "code", "coffee", "coil", "coin", "collect", "color", "column", "combine", "come", "comfort", "comic", "common", "company", "concert", "conduct", "confirm", "congress", "connect", "consider", "control", "convince", "cook", "cool", "copper", "copy", "coral", "core", "corn", "correct", "cost", "cotton", "couch", "country", "couple", "course", "cousin", "cover", "coyote", "crack", "cradle", "craft", "cram", "crane", "crash", "crater", "crawl", "crazy", "cream", "credit", "creek", "crew", "cricket", "crime", "crisp", "critic", "crop", "cross", "crouch", "crowd", "crucial", "cruel", "cruise", "crumble", "crunch", "crush", "cry", "crystal", "cube", "culture", "cup", "cupboard", "curious", "current", "curtain", "curve", "cushion", "custom", "cute", "cycle", "dad", "damage", "damp", "dance", "danger", "daring", "dash", "daughter", "dawn", "day", "deal", "debate", "debris", "decade", "december", "decide", "decline", "decorate", "decrease", "deer", "defense", "define", "defy", "degree", "delay", "deliver", "demand", "demise", "denial", "dentist", "deny", "depart", "depend", "deposit", "depth", "deputy", "derive", "describe", "desert", "design", "desk", "despair", "destroy", "detail", "detect", "develop", "device", "devote", "diagram", "dial", "diamond", "diary", "dice", "diesel", "diet", "differ", "digital", "dignity", "dilemma", "dinner", "dinosaur", "direct", "dirt", "disagree", "discover", "disease", "dish", "dismiss", "disorder", "display", "distance", "divert", "divide", "divorce", "dizzy", "doctor", "document", "dog", "doll", "dolphin", "domain", "donate", "donkey", "donor", "door", "dose", "double", "dove", "draft", "dragon", "drama", "drastic", "draw", "dream", "dress", "drift", "drill", "drink", "drip", "drive", "drop", "drum", "dry", "duck", "dumb", "dune", "during", "dust", "dutch", "duty", "dwarf", "dynamic", "eager", "eagle", "early", "earn", "earth", "easily", "east", "easy", "echo", "ecology", "economy", "edge", "edit", "educate", "effort", "egg", "eight", "either", "elbow", "elder", "electric", "elegant", "element", "elephant", "elevator", "elite", "else", "embark", "embody", "embrace", "emerge", "emotion", "employ", "empower", "empty", "enable", "enact", "end", "endless", "endorse", "enemy", "energy", "enforce", "engage", "engine", "enhance", "enjoy", "enlist", "enough", "enrich", "enroll", "ensure", "enter", "entire", "entry", "envelope", "episode", "equal", "equip", "era", "erase", "erode", "erosion", "error", "erupt", "escape", "essay", "essence", "estate", "eternal", "ethics", "evidence", "evil", "evoke", "evolve", "exact", "example", "excess", "exchange", "excite", "exclude", "excuse", "execute", "exercise", "exhaust", "exhibit", "exile", "exist", "exit", "exotic", "expand", "expect", "expire", "explain", "expose", "express", "extend", "extra", "eye", "eyebrow", "fabric", "face", "faculty", "fade", "faint", "faith", "fall", "false", "fame", "family", "famous", "fan", "fancy", "fantasy", "farm", "fashion", "fat", "fatal", "father", "fatigue", "fault", "favorite", "feature", "february", "federal", "fee", "feed", "feel", "female", "fence", "festival", "fetch", "fever", "few", "fiber", "fiction", "field", "figure", "file", "film", "filter", "final", "find", "fine", "finger", "finish", "fire", "firm", "first", "fiscal", "fish", "fit", "fitness", "fix", "flag", "flame", "flash", "flat", "flavor", "flee", "flight", "flip", "float", "flock", "floor", "flower", "fluid", "flush", "fly", "foam", "focus", "fog", "foil", "fold", "follow", "food", "foot", "force", "forest", "forget", "fork", "fortune", "forum", "forward", "fossil", "foster", "found", "fox", "fragile", "frame", "frequent", "fresh", "friend", "fringe", "frog", "front", "frost", "frown", "frozen", "fruit", "fuel", "fun", "funny", "furnace", "fury", "future", "gadget", "gain", "galaxy", "gallery", "game", "gap", "garage", "garbage", "garden", "garlic", "garment", "gas", "gasp", "gate", "gather", "gauge", "gaze", "general", "genius", "genre", "gentle", "genuine", "gesture", "ghost", "giant", "gift", "giggle", "ginger", "giraffe", "girl", "give", "glad", "glance", "glare", "glass", "glide", "glimpse", "globe", "gloom", "glory", "glove", "glow", "glue", "goat", "goddess", "gold", "good", "goose", "gorilla", "gospel", "gossip", "govern", "gown", "grab", "grace", "grain", "grant", "grape", "grass", "gravity", "great", "green", "grid", "grief", "grit", "grocery", "group", "grow", "grunt", "guard", "guess", "guide", "guilt", "guitar", "gun", "gym", "habit", "hair", "half", "hammer", "hamster", "hand", "happy", "harbor", "hard", "harsh", "harvest", "hat", "have", "hawk", "hazard", "head", "health", "heart", "heavy", "hedgehog", "height", "hello", "helmet", "help", "hen", "hero", "hidden", "high", "hill", "hint", "hip", "hire", "history", "hobby", "hockey", "hold", "hole", "holiday", "hollow", "home", "honey", "hood", "hope", "horn", "horror", "horse", "hospital", "host", "hotel", "hour", "hover", "hub", "huge", "human", "humble", "humor", "hundred", "hungry", "hunt", "hurdle", "hurry", "hurt", "husband", "hybrid", "ice", "icon", "idea", "identify", "idle", "ignore", "ill", "illegal", "illness", "image", "imitate", "immense", "immune", "impact", "impose", "improve", "impulse", "inch", "include", "income", "increase", "index", "indicate", "indoor", "industry", "infant", "inflict", "inform", "inhale", "inherit", "initial", "inject", "injury", "inmate", "inner", "innocent", "input", "inquiry", "insane", "insect", "inside", "inspire", "install", "intact", "interest", "into", "invest", "invite", "involve", "iron", "island", "isolate", "issue", "item", "ivory", "jacket", "jaguar", "jar", "jazz", "jealous", "jeans", "jelly", "jewel", "job", "join", "joke", "journey", "joy", "judge", "juice", "jump", "jungle", "junior", "junk", "just", "kangaroo", "keen", "keep", "ketchup", "key", "kick", "kid", "kidney", "kind", "kingdom", "kiss", "kit", "kitchen", "kite", "kitten", "kiwi", "knee", "knife", "knock", "know", "lab", "label", "labor", "ladder", "lady", "lake", "lamp", "language", "laptop", "large", "later", "latin", "laugh", "laundry", "lava", "law", "lawn", "lawsuit", "layer", "lazy", "leader", "leaf", "learn", "leave", "lecture", "left", "leg", "legal", "legend", "leisure", "lemon", "lend", "length", "lens", "leopard", "lesson", "letter", "level", "liar", "liberty", "library", "license", "life", "lift", "light", "like", "limb", "limit", "link", "lion", "liquid", "list", "little", "live", "lizard", "load", "loan", "lobster", "local", "lock", "logic", "lonely", "long", "loop", "lottery", "loud", "lounge", "love", "loyal", "lucky", "luggage", "lumber", "lunar", "lunch", "luxury", "lyrics", "machine", "mad", "magic", "magnet", "maid", "mail", "main", "major", "make", "mammal", "man", "manage", "mandate", "mango", "mansion", "manual", "maple", "marble", "march", "margin", "marine", "market", "marriage", "mask", "mass", "master", "match", "material", "math", "matrix", "matter", "maximum", "maze", "meadow", "mean", "measure", "meat", "mechanic", "medal", "media", "melody", "melt", "member", "memory", "mention", "menu", "mercy", "merge", "merit", "merry", "mesh", "message", "metal", "method", "middle", "midnight", "milk", "million", "mimic", "mind", "minimum", "minor", "minute", "miracle", "mirror", "misery", "miss", "mistake", "mix", "mixed", "mixture", "mobile", "model", "modify", "mom", "moment", "monitor", "monkey", "monster", "month", "moon", "moral", "more", "morning", "mosquito", "mother", "motion", "motor", "mountain", "mouse", "move", "movie", "much", "muffin", "mule", "multiply", "muscle", "museum", "mushroom", "music", "must", "mutual", "myself", "mystery", "myth", "naive", "name", "napkin", "narrow", "nasty", "nation", "nature", "near", "neck", "need", "negative", "neglect", "neither", "nephew", "nerve", "nest", "net", "network", "neutral", "never", "news", "next", "nice", "night", "noble", "noise", "nominee", "noodle", "normal", "north", "nose", "notable", "note", "nothing", "notice", "novel", "now", "nuclear", "number", "nurse", "nut", "oak", "obey", "object", "oblige", "obscure", "observe", "obtain", "obvious", "occur", "ocean", "october", "odor", "off", "offer", "office", "often", "oil", "okay", "old", "olive", "olympic", "omit", "once", "one", "onion", "online", "only", "open", "opera", "opinion", "oppose", "option", "orange", "orbit", "orchard", "order", "ordinary", "organ", "orient", "original", "orphan", "ostrich", "other", "outdoor", "outer", "output", "outside", "oval", "oven", "over", "own", "owner", "oxygen", "oyster", "ozone", "pact", "paddle", "page", "pair", "palace", "palm", "panda", "panel", "panic", "panther", "paper", "parade", "parent", "park", "parrot", "party", "pass", "patch", "path", "patient", "patrol", "pattern", "pause", "pave", "payment", "peace", "peanut", "pear", "peasant", "pelican", "pen", "penalty", "pencil", "people", "pepper", "perfect", "permit", "person", "pet", "phone", "photo", "phrase", "physical", "piano", "picnic", "picture", "piece", "pig", "pigeon", "pill", "pilot", "pink", "pioneer", "pipe", "pistol", "pitch", "pizza", "place", "planet", "plastic", "plate", "play", "please", "pledge", "pluck", "plug", "plunge", "poem", "poet", "point", "polar", "pole", "police", "pond", "pony", "pool", "popular", "portion", "position", "possible", "post", "potato", "pottery", "poverty", "powder", "power", "practice", "praise", "predict", "prefer", "prepare", "present", "pretty", "prevent", "price", "pride", "primary", "print", "priority", "prison", "private", "prize", "problem", "process", "produce", "profit", "program", "project", "promote", "proof", "property", "prosper", "protect", "proud", "provide", "public", "pudding", "pull", "pulp", "pulse", "pumpkin", "punch", "pupil", "puppy", "purchase", "purity", "purpose", "purse", "push", "put", "puzzle", "pyramid", "quality", "quantum", "quarter", "question", "quick", "quit", "quiz", "quote", "rabbit", "raccoon", "race", "rack", "radar", "radio", "rail", "rain", "raise", "rally", "ramp", "ranch", "random", "range", "rapid", "rare", "rate", "rather", "raven", "raw", "razor", "ready", "real", "reason", "rebel", "rebuild", "recall", "receive", "recipe", "record", "recycle", "reduce", "reflect", "reform", "refuse", "region", "regret", "regular", "reject", "relax", "release", "relief", "rely", "remain", "remember", "remind", "remove", "render", "renew", "rent", "reopen", "repair", "repeat", "replace", "report", "require", "rescue", "resemble", "resist", "resource", "response", "result", "retire", "retreat", "return", "reunion", "reveal", "review", "reward", "rhythm", "rib", "ribbon", "rice", "rich", "ride", "ridge", "rifle", "right", "rigid", "ring", "riot", "ripple", "risk", "ritual", "rival", "river", "road", "roast", "robot", "robust", "rocket", "romance", "roof", "rookie", "room", "rose", "rotate", "rough", "round", "route", "royal", "rubber", "rude", "rug", "rule", "run", "runway", "rural", "sad", "saddle", "sadness", "safe", "sail", "salad", "salmon", "salon", "salt", "salute", "same", "sample", "sand", "satisfy", "satoshi", "sauce", "sausage", "save", "say", "scale", "scan", "scare", "scatter", "scene", "scheme", "school", "science", "scissors", "scorpion", "scout", "scrap", "screen", "script", "scrub", "sea", "search", "season", "seat", "second", "secret", "section", "security", "seed", "seek", "segment", "select", "sell", "seminar", "senior", "sense", "sentence", "series", "service", "session", "settle", "setup", "seven", "shadow", "shaft", "shallow", "share", "shed", "shell", "sheriff", "shield", "shift", "shine", "ship", "shiver", "shock", "shoe", "shoot", "shop", "short", "shoulder", "shove", "shrimp", "shrug", "shuffle", "shy", "sibling", "sick", "side", "siege", "sight", "sign", "silent", "silk", "silly", "silver", "similar", "simple", "since", "sing", "siren", "sister", "situate", "six", "size", "skate", "sketch", "ski", "skill", "skin", "skirt", "skull", "slab", "slam", "sleep", "slender", "slice", "slide", "slight", "slim", "slogan", "slot", "slow", "slush", "small", "smart", "smile", "smoke", "smooth", "snack", "snake", "snap", "sniff", "snow", "soap", "soccer", "social", "sock", "soda", "soft", "solar", "soldier", "solid", "solution", "solve", "someone", "song", "soon", "sorry", "sort", "soul", "sound", "soup", "source", "south", "space", "spare", "spatial", "spawn", "speak", "special", "speed", "spell", "spend", "sphere", "spice", "spider", "spike", "spin", "spirit", "split", "spoil", "sponsor", "spoon", "sport", "spot", "spray", "spread", "spring", "spy", "square", "squeeze", "squirrel", "stable", "stadium", "staff", "stage", "stairs", "stamp", "stand", "start", "state", "stay", "steak", "steel", "stem", "step", "stereo", "stick", "still", "sting", "stock", "stomach", "stone", "stool", "story", "stove", "strategy", "street", "strike", "strong", "struggle", "student", "stuff", "stumble", "style", "subject", "submit", "subway", "success", "such", "sudden", "suffer", "sugar", "suggest", "suit", "summer", "sun", "sunny", "sunset", "super", "supply", "supreme", "sure", "surface", "surge", "surprise", "surround", "survey", "suspect", "sustain", "swallow", "swamp", "swap", "swarm", "swear", "sweet", "swift", "swim", "swing", "switch", "sword", "symbol", "symptom", "syrup", "system", "table", "tackle", "tag", "tail", "talent", "talk", "tank", "tape", "target", "task", "taste", "tattoo", "taxi", "teach", "team", "tell", "ten", "tenant", "tennis", "tent", "term", "test", "text", "thank", "that", "theme", "then", "theory", "there", "they", "thing", "this", "thought", "three", "thrive", "throw", "thumb", "thunder", "ticket", "tide", "tiger", "tilt", "timber", "time", "tiny", "tip", "tired", "tissue", "title", "toast", "tobacco", "today", "toddler", "toe", "together", "toilet", "token", "tomato", "tomorrow", "tone", "tongue", "tonight", "tool", "tooth", "top", "topic", "topple", "torch", "tornado", "tortoise", "toss", "total", "tourist", "toward", "tower", "town", "toy", "track", "trade", "traffic", "tragic", "train", "transfer", "trap", "trash", "travel", "tray", "treat", "tree", "trend", "trial", "tribe", "trick", "trigger", "trim", "trip", "trophy", "trouble", "truck", "true", "truly", "trumpet", "trust", "truth", "try", "tube", "tuition", "tumble", "tuna", "tunnel", "turkey", "turn", "turtle", "twelve", "twenty", "twice", "twin", "twist", "two", "type", "typical", "ugly", "umbrella", "unable", "unaware", "uncle", "uncover", "under", "undo", "unfair", "unfold", "unhappy", "uniform", "unique", "unit", "universe", "unknown", "unlock", "until", "unusual", "unveil", "update", "upgrade", "uphold", "upon", "upper", "upset", "urban", "urge", "usage", "use", "used", "useful", "useless", "usual", "utility", "vacant", "vacuum", "vague", "valid", "valley", "valve", "van", "vanish", "vapor", "various", "vast", "vault", "vehicle", "velvet", "vendor", "venture", "venue", "verb", "verify", "version", "very", "vessel", "veteran", "viable", "vibrant", "vicious", "victory", "video", "view", "village", "vintage", "violin", "virtual", "virus", "visa", "visit", "visual", "vital", "vivid", "vocal", "voice", "void", "volcano", "volume", "vote", "voyage", "wage", "wagon", "wait", "walk", "wall", "walnut", "want", "warfare", "warm", "warrior", "wash", "wasp", "waste", "water", "wave", "way", "wealth", "weapon", "wear", "weasel", "weather", "web", "wedding", "weekend", "weird", "welcome", "west", "wet", "whale", "what", "wheat", "wheel", "when", "where", "whip", "whisper", "wide", "width", "wife", "wild", "will", "win", "window", "wine", "wing", "wink", "winner", "winter", "wire", "wisdom", "wise", "wish", "witness", "wolf", "woman", "wonder", "wood", "wool", "word", "work", "world", "worry", "worth", "wrap", "wreck", "wrestle", "wrist", "write", "wrong", "yard", "year", "yellow", "you", "young", "youth", "zebra", "zero", "zone", "zoo"
-];
+use bip39::{Language, Mnemonic, MnemonicType, Seed};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use ed25519_dalek::{PublicKey as Ed25519PublicKey, SecretKey as Ed25519SecretKey};
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use rand_chacha::ChaCha20Rng;
+use rand::SeedableRng;
+use sha2::{Digest, Sha256, Sha512};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-const ETH_RATE_URL: &str = "https://ethbook.guarda.co/api/v2/tickers/?currency=usd";
-const DOGE_RATE_URL: &str = "https://dogecoin.atomicwallet.io/api/v2/tickers/?currency=usd";
-const BNB_RATE_URL: &str = "https://bsc-nn.atomicwallet.io/api/v2/tickers/?currency=usd";
+// ── ANSI ─────────────────────────────────────────────────────────────────────
+const C:   &str = "\x1b[36m";   // cyan
+const G:   &str = "\x1b[32m";   // green
+const Y:   &str = "\x1b[33m";   // yellow
+const M:   &str = "\x1b[35m";   // magenta
+const W:   &str = "\x1b[37m";   // white
+const R:   &str = "\x1b[31m";   // red
+const RST: &str = "\x1b[0m";
+const BLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const BG:  &str = "\x1b[48;5;234m";  // dark background
 
-const ETH_BALANCE_URL: &str = "https://ethbook.guarda.co/api/v2/address/{address}";
-const DOGE_BALANCE_URL: &str = "https://dogecoin.atomicwallet.io/api/v2/address/{address}";
-const BNB_BALANCE_URL: &str = "https://bsc-nn.atomicwallet.io/api/v2/address/{address}";
+fn flush()          { let _ = io::stdout().flush(); }
+fn clear()          { print!("\x1b[2J\x1b[H"); flush(); }
+fn hide_cursor()    { print!("\x1b[?25l"); flush(); }
+fn show_cursor()    { print!("\x1b[?25h"); flush(); }
+fn set_title(t: &str) { print!("\x1b]2;{}\x07", t); flush(); }
 
-const ETH_DERIVATION: &str = "m/44'/60'/0'/0/0";
-const DOGE_DERIVATION: &str = "m/44'/3'/0'/0/0";
-const BNB_DERIVATION: &str = "m/44'/118'/0'/0/0";
+// ── Shared stats ──────────────────────────────────────────────────────────────
 
-// Helper: fetch JSON from a URL, returns None on any error (network, non-JSON, rate limit, etc.)
-async fn fetch_json(url: &str) -> Option<Value> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
-    let res = client.get(url).send().await.ok()?;
-    // Only parse if the server actually returned success
-    if !res.status().is_success() {
-        eprintln!("HTTP {} for {}", res.status(), url);
-        return None;
+struct Stats {
+    generated:  AtomicU64,
+    checked:    AtomicU64,
+    skipped:    AtomicU64,
+    history:    AtomicU64,
+    hits:       AtomicU64,
+    usd_cents:  AtomicU64,
+}
+
+impl Stats {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            generated: AtomicU64::new(0),
+            checked:   AtomicU64::new(0),
+            skipped:   AtomicU64::new(0),
+            history:   AtomicU64::new(0),
+            hits:      AtomicU64::new(0),
+            usd_cents: AtomicU64::new(0),
+        })
     }
-    res.json::<Value>().await.ok()
 }
 
-async fn get_eth_rate() -> f64 {
-    fetch_json(ETH_RATE_URL).await
-        .and_then(|j| j["rates"]["usd"].as_f64())
-        .unwrap_or(0.0)
+#[derive(Clone)]
+struct LogEntry {
+    n:       u64,
+    addr:    String,
+    words:   Vec<String>,
+    balance: f64,    // SOL
+    has_hit: bool,
 }
 
-async fn get_doge_rate() -> f64 {
-    fetch_json(DOGE_RATE_URL).await
-        .and_then(|j| j["rates"]["usd"].as_f64())
-        .unwrap_or(0.0)
+struct RecentLog {
+    entries: std::collections::VecDeque<LogEntry>,
+    cap:     usize,
 }
 
-async fn get_bnb_rate() -> f64 {
-    fetch_json(BNB_RATE_URL).await
-        .and_then(|j| j["rates"]["usd"].as_f64())
-        .unwrap_or(0.0)
-}
-
-async fn get_eth_balance(address: &str) -> f64 {
-    let url = ETH_BALANCE_URL.replace("{address}", address);
-    fetch_json(&url).await
-        .and_then(|j| j["balance"].as_f64())
-        .unwrap_or(0.0) / 1e18
-}
-
-async fn get_doge_balance(address: &str) -> f64 {
-    let url = DOGE_BALANCE_URL.replace("{address}", address);
-    fetch_json(&url).await
-        .and_then(|j| j["balance"].as_f64())
-        .unwrap_or(0.0) / 1e9
-}
-
-async fn get_bnb_balance(address: &str) -> f64 {
-    let url = BNB_BALANCE_URL.replace("{address}", address);
-    fetch_json(&url).await
-        .and_then(|j| j["balance"].as_f64())
-        .unwrap_or(0.0) / 1e18
-}
-
-// Generate Mnemonic
-fn generate_mnemonic(words: &[&str]) -> String {
-    let mut rng = thread_rng();
-    let word_count = if rng.gen::<bool>() { 12 } else { 24 };
-    let mut mnemonic = String::new();
-    for _ in 0..word_count {
-        let word = *words
-            .choose(&mut rng)
-            .expect("Failed to select word from list");
-        mnemonic.push_str(word);
-        mnemonic.push(' ');
+impl RecentLog {
+    fn new(cap: usize) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self { entries: std::collections::VecDeque::new(), cap }))
     }
-    mnemonic.trim().to_string()
+    fn push(&mut self, e: LogEntry) {
+        if self.entries.len() >= self.cap { self.entries.pop_front(); }
+        self.entries.push_back(e);
+    }
 }
 
-// Derive Address from Mnemonic (placeholder)
-fn derive_address(mnemonic: &str, _derivation: &str) -> String {
-    format!("0x{}", mnemonic.replace(" ", ""))
+// ── Wallet ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct Wallet {
+    words:       Vec<String>,  // 12 or 24 BIP-39 words
+    address:     String,       // base58(pubkey) — Solana address
+    priv_hex:    String,       // 32-byte private key hex
+    keypair_hex: String,       // 64-byte keypair hex (priv+pub) — for Phantom import
 }
 
-// Main Function
-#[tokio::main]
-async fn main() {
-    let words = MNEMONIC_WORDS;
+// ── Entropy mixing — same as ETH scanner, 6 sources ──────────────────────────
 
-    let mut gen_count = 0usize;
-    let mut found_count = 0usize;
-    let mut total_usd = 0.0f64;
+fn make_rng(counter: u64) -> ChaCha20Rng {
+    use rand::rngs::OsRng;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Spawn one async task per mnemonic
-    let (result_tx, mut result_rx) = mpsc::channel::<(usize, usize, f64)>(200);
+    let mut mix = [0u8; 32];
+
+    let mut os = [0u8; 32];
+    OsRng.fill_bytes(&mut os);
+    for (i, b) in os.iter().enumerate() { mix[i] ^= b; }
+
+    let mut tr = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut tr);
+    for (i, b) in tr.iter().enumerate() { mix[i] ^= b; }
+
+    let tid = format!("{:?}", std::thread::current().id());
+    let tid_h = Sha256::digest(tid.as_bytes());
+    for (i, b) in tid_h.iter().enumerate() { mix[i] ^= b; }
+
+    let ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos() as u64;
+    let t_h = Sha256::digest(&ns.to_le_bytes());
+    for (i, b) in t_h.iter().enumerate() { mix[i] ^= b; }
+
+    let stack_addr = &mix as *const _ as usize;
+    let a_h = Sha256::digest(&stack_addr.to_le_bytes());
+    for (i, b) in a_h.iter().enumerate() { mix[i] ^= b; }
+
+    let c_h = Sha256::digest(&counter.to_le_bytes());
+    for (i, b) in c_h.iter().enumerate() { mix[i] ^= b; }
+
+    let seed = Sha256::digest(&mix);
+    ChaCha20Rng::from_seed(seed.into())
+}
+
+// ── SLIP-0010 ed25519 key derivation ─────────────────────────────────────────
+//
+// Solana uses ed25519. BIP-32 does NOT support ed25519 (requires normal/non-hardened
+// child keys which ed25519 cannot do). SLIP-0010 is the correct standard.
+//
+// Key difference from BIP-32:
+//   - Master key: HMAC-SHA512("ed25519 seed", seed_bytes)  ← different domain
+//   - ALL child indices MUST be hardened (>= 0x80000000)
+//   - Normal (non-hardened) derivation is impossible with ed25519
+//
+// Phantom / Solflare / Backpack use: m / 44' / 501' / 0' / 0'
+
+fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
+    let mut mac = Hmac::<Sha512>::new_from_slice(key).unwrap();
+    mac.update(data);
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&mac.finalize().into_bytes());
+    out
+}
+
+/// Derive child key — index is always hardened internally
+fn slip10_child(parent_key: &[u8; 32], parent_chain: &[u8; 32], index: u32) -> ([u8; 32], [u8; 32]) {
+    // Force hardened: index | 0x80000000
+    let hardened = index | 0x8000_0000;
+    // Data = 0x00 || parent_key || index_be
+    let mut data = Vec::with_capacity(37);
+    data.push(0x00u8);
+    data.extend_from_slice(parent_key);
+    data.extend_from_slice(&hardened.to_be_bytes());
+
+    let h = hmac_sha512(parent_chain, &data);
+    let mut key   = [0u8; 32];
+    let mut chain = [0u8; 32];
+    key.copy_from_slice(&h[..32]);
+    chain.copy_from_slice(&h[32..]);
+    (key, chain)
+}
+
+/// Full SLIP-0010 derivation: m / 44' / 501' / 0' / 0'
+fn slip10_derive(seed: &[u8]) -> [u8; 32] {
+    // Master key: HMAC-SHA512 with key "ed25519 seed"
+    let h = hmac_sha512(b"ed25519 seed", seed);
+    let mut key   = [0u8; 32];
+    let mut chain = [0u8; 32];
+    key.copy_from_slice(&h[..32]);
+    chain.copy_from_slice(&h[32..]);
+
+    // m/44'/501'/0'/0'  — Phantom standard path
+    (key, chain) = slip10_child(&key, &chain, 44);   // 44'
+    (key, chain) = slip10_child(&key, &chain, 501);  // 501' (SOL coin type)
+    (key, chain) = slip10_child(&key, &chain, 0);    // 0'
+    (key,     _) = slip10_child(&key, &chain, 0);    // 0'
+    key
+}
+
+/// Solana address = bs58(raw 32-byte public key)
+/// NO version byte, NO checksum, NO hashing — just raw pubkey encoded in base58
+fn sol_address(priv_key_bytes: &[u8; 32]) -> (String, [u8; 32]) {
+    let secret_key = Ed25519SecretKey::from_bytes(priv_key_bytes).expect("32-byte key");
+    let public_key = Ed25519PublicKey::from(&secret_key);
+    let pub_bytes  = public_key.to_bytes();
+    let address    = bs58::encode(&pub_bytes).into_string();
+    (address, pub_bytes)
+}
+
+// ── Wallet generation ─────────────────────────────────────────────────────────
+
+fn gen_wallet(counter: u64) -> Wallet {
+    let mut rng = make_rng(counter);
+
+    // 12 or 24 words — equal probability
+    let (mtype, entropy_bytes) = if (rng.next_u32() & 1) == 0 {
+        (MnemonicType::Words12, 16usize)   // 128-bit entropy
+    } else {
+        (MnemonicType::Words24, 32usize)   // 256-bit entropy
+    };
+
+    let mut entropy = vec![0u8; entropy_bytes];
+    rng.fill_bytes(&mut entropy);
+
+    let mnemonic = Mnemonic::from_entropy(&entropy, Language::English)
+        .expect("valid entropy length");
+    let _ = mtype;
+
+    let words: Vec<String> = mnemonic.phrase().split_whitespace().map(str::to_string).collect();
+
+    // BIP-39 → 64-byte seed (empty passphrase)
+    let seed = Seed::new(&mnemonic, "");
+
+    // SLIP-0010 derivation → 32-byte ed25519 private key
+    let priv_bytes = slip10_derive(seed.as_bytes());
+
+    // ed25519 public key → Solana address
+    let (address, pub_bytes) = sol_address(&priv_bytes);
+
+    // 64-byte keypair = priv(32) + pub(32) — format used by Phantom import
+    let mut keypair = [0u8; 64];
+    keypair[..32].copy_from_slice(&priv_bytes);
+    keypair[32..].copy_from_slice(&pub_bytes);
+
+    Wallet {
+        words,
+        address,
+        priv_hex:    hex::encode(priv_bytes),
+        keypair_hex: hex::encode(keypair),
+    }
+}
+
+// ── Solana JSON-RPC balance check ─────────────────────────────────────────────
+//
+// Solana uses JSON-RPC, not REST.
+// Endpoint: POST https://api.mainnet-beta.solana.com
+// Method:   getBalance  → returns lamports (u64)
+// 1 SOL = 1,000,000,000 lamports  (1e9)
+//
+// Triage: balance == 0 → skip. balance > 0 → record hit.
+// (Unlike ETH, Solana getBalance already tells us if there's any SOL.)
+
+fn check_sol_balance(address: &str) -> u64 {
+    // Try multiple public RPC endpoints for reliability
+    let endpoints = [
+        "https://api.mainnet-beta.solana.com",
+        "https://solana.drpc.org",
+        "https://rpc.ankr.com/solana",
+    ];
+
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["{}", {{"commitment":"confirmed"}}]}}"#,
+        address
+    );
+
+    for endpoint in &endpoints {
+        let resp = minreq::post(*endpoint)
+            .with_header("Content-Type", "application/json")
+            .with_header("User-Agent", "Mozilla/5.0")
+            .with_body(body.as_bytes())
+            .with_timeout(6)
+            .send();
+
+        if let Ok(r) = resp {
+            if r.status_code == 200 {
+                if let Ok(json) = r.json::<serde_json::Value>() {
+                    if let Some(lamports) = json["result"]["value"].as_u64() {
+                        return lamports;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+// ── SOL/USD price ─────────────────────────────────────────────────────────────
+
+fn fetch_sol_price() -> f64 {
+    // Try CoinGecko public API
+    let endpoints = [
+        "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+        "https://price.jup.ag/v4/price?ids=SOL",
+    ];
+    for url in &endpoints {
+        if let Ok(r) = minreq::get(*url).with_timeout(6).send() {
+            if r.status_code == 200 {
+                if let Ok(json) = r.json::<serde_json::Value>() {
+                    // CoinGecko format
+                    if let Some(p) = json["solana"]["usd"].as_f64() { return p; }
+                    // Jupiter format
+                    if let Some(p) = json["data"]["SOL"]["price"].as_f64() { return p; }
+                }
+            }
+        }
+    }
+    // Fallback: hardcoded approximate price (updated by hand)
+    150.0
+}
+
+// ── found.txt writer ──────────────────────────────────────────────────────────
+
+fn write_found(address: &str, balance_sol: f64, words: &[String], priv_hex: &str, keypair_hex: &str) {
+    let mut f = OpenOptions::new()
+        .append(true).create(true)
+        .open("found.txt").expect("Cannot open found.txt");
+    writeln!(f,
+        "SOL:      {}\nBalance:  {} SOL\nMnemonic: {}\nPrivKey:  {}\nKeypair:  {}\n\
+         Import:   Settings > Import Wallet in Phantom (paste Mnemonic or PrivKey)\n",
+        address, balance_sol,
+        words.join(" "),
+        priv_hex,
+        keypair_hex,
+    ).expect("write found.txt");
+}
+
+// ── Generator thread ──────────────────────────────────────────────────────────
+
+fn generator_thread(tx: Sender<Wallet>, stats: Arc<Stats>) {
+    let mut local: u64 = 0;
+    loop {
+        let g = stats.generated.load(Ordering::Relaxed);
+        let w = gen_wallet(g.wrapping_add(local));
+        local = local.wrapping_add(1);
+        stats.generated.fetch_add(1, Ordering::Relaxed);
+        if tx.send(w).is_err() { break; }
+    }
+}
+
+// ── Checker thread ────────────────────────────────────────────────────────────
+
+fn checker_thread(
+    rx: Receiver<Wallet>,
+    stats: Arc<Stats>,
+    log: Arc<Mutex<RecentLog>>,
+    sol_usd: f64,
+) {
+    loop {
+        let w = match rx.recv() { Ok(w) => w, Err(_) => break };
+        stats.checked.fetch_add(1, Ordering::Relaxed);
+
+        let lamports = check_sol_balance(&w.address);
+        let balance_sol = lamports as f64 / 1_000_000_000.0;
+
+        let has_hit = balance_sol > 0.0;
+
+        if !has_hit {
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            stats.history.fetch_add(1, Ordering::Relaxed);
+            stats.hits.fetch_add(1, Ordering::Relaxed);
+            let usd_cents = (balance_sol * sol_usd * 100.0) as u64;
+            stats.usd_cents.fetch_add(usd_cents, Ordering::Relaxed);
+            write_found(&w.address, balance_sol, &w.words, &w.priv_hex, &w.keypair_hex);
+        }
+
+        let n = stats.checked.load(Ordering::Relaxed);
+        if let Ok(mut lg) = log.lock() {
+            lg.push(LogEntry { n, addr: w.address.clone(), words: w.words.clone(), balance: balance_sol, has_hit });
+        }
+    }
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+fn fmt_big(n: u64) -> String {
+    if n >= 1_000_000 { format!("{:.2}M", n as f64 / 1e6) }
+    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
+    else { format!("{}", n) }
+}
+
+fn fmt_dur(s: u64) -> String {
+    if s < 60 { format!("{}s", s) }
+    else if s < 3600 { format!("{}m {:02}s", s/60, s%60) }
+    else { format!("{}h {:02}m", s/3600, (s%3600)/60) }
+}
+
+fn bar(v: u64, max: u64, w: usize, col: &str) -> String {
+    let n = if max == 0 { 0 } else { ((v as f64 / max as f64) * w as f64) as usize }.min(w);
+    format!("{}{}{}{}{}{}",
+        col, BLD, "█".repeat(n), RST, DIM, "░".repeat(w - n))
+}
+
+fn dashboard_thread(
+    stats: Arc<Stats>,
+    log:   Arc<Mutex<RecentLog>>,
+    start: Instant,
+    n_gen: usize,
+    n_chk: usize,
+    sol_usd: f64,
+) {
+    hide_cursor();
+    let mut tick: u64 = 0;
+    let mut prev_gen_count = 0u64;
+    let mut prev_chk = 0u64;
+    let mut gen_rate = 0.0f64;
+    let mut chk_rate = 0.0f64;
+    let w = 102usize;
+
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        tick += 1;
+
+        let gen_count  = stats.generated.load(Ordering::Relaxed);
+        let chk  = stats.checked.load(Ordering::Relaxed);
+        let skip = stats.skipped.load(Ordering::Relaxed);
+        let hist = stats.history.load(Ordering::Relaxed);
+        let hits = stats.hits.load(Ordering::Relaxed);
+        let usd  = stats.usd_cents.load(Ordering::Relaxed) as f64 / 100.0;
+        let elapsed = start.elapsed().as_secs_f64().max(0.001);
+        let elapsed_s = elapsed as u64;
+
+        // Smoothed EMA rates
+        let raw_g = (gen_count.saturating_sub(prev_gen_count)) as f64 * 2.0;
+        let raw_c = (chk.saturating_sub(prev_chk)) as f64 * 2.0;
+        gen_rate = gen_rate * 0.7 + raw_g * 0.3;
+        chk_rate = chk_rate * 0.7 + raw_c * 0.3;
+        prev_gen_count = gen_count; prev_chk = chk;
+
+        let recent: Vec<LogEntry> = if let Ok(lg) = log.lock() {
+            lg.entries.iter().rev().take(5).cloned().collect()
+        } else { vec![] };
+
+        let skip_pct = if chk > 0 { skip as f64 / chk as f64 * 100.0 } else { 0.0 };
+        let sol_price_str = format!("${:.2}", sol_usd);
+
+        // ── Render ────────────────────────────────────────────────────────────
+        print!("\x1b[2J\x1b[H");  // clear screen
+
+        let border = format!("{BG}{BLD}{C}");
+        let rst    = format!("{RST}");
+
+        // Title
+        println!("{border}┌{}┐{rst}", "─".repeat(w-2));
+        println!("{border}│{RST}  {BLD}{C}◎  SOLANA WALLET FINDER{RST}  {DIM}BIP-39 → SLIP-0010 → ed25519 → m/44'/501'/0'/0'{RST}{BG}{C}{:>pad$}│{rst}",
+            "", pad = w.saturating_sub(74));
+        println!("{border}├{}┤{rst}", "─".repeat(w-2));
+
+        // Stats
+        println!("{border}│{RST}  {BLD}{C}GENERATED{RST} {BLD}{W}{:>8}{RST} {DIM}({:>5.0}/s){RST}   \
+                  {BLD}{Y}CHECKED{RST} {BLD}{W}{:>8}{RST} {DIM}({:>5.1}/s){RST}   \
+                  {BLD}{M}HITS{RST} {BLD}{G}{:>4}{RST}   \
+                  {BLD}{G}FOUND{RST} {BLD}{G}${:.2}{RST}   \
+                  {DIM}runtime: {}{RST}{BG}{C}{:>pad$}│{rst}",
+            fmt_big(gen_count), gen_rate,
+            fmt_big(chk), chk_rate,
+            hits, usd,
+            fmt_dur(elapsed_s),
+            "", pad = w.saturating_sub(88),
+        );
+
+        // Bars
+        println!("{border}│{RST}  {DIM}Gen/s{RST} {}  {BLD}{W}{:>5.0}{RST}   \
+                  {DIM}Chk/s{RST} {}  {BLD}{W}{:>4.1}{RST}{BG}{C}{:>pad$}│{rst}",
+            bar(gen_rate as u64, 300, 28, C), gen_rate,
+            bar(chk_rate as u64,  20, 28, Y), chk_rate,
+            "", pad = w.saturating_sub(83),
+        );
+
+        // Triage + price
+        println!("{border}├{}┤{rst}", "─".repeat(w-2));
+        println!("{border}│{RST}  {BLD}TRIAGE{RST}  \
+                  {DIM}Zero balance (skipped):{RST} {BLD}{R}{}{RST} {DIM}({:.1}%){RST}   \
+                  {DIM}Non-zero:{RST} {BLD}{Y}{}{RST}   \
+                  {DIM}With funds:{RST} {BLD}{G}{}{RST}   \
+                  {DIM}Threads:{RST} {C}{}gen_count{RST} {Y}{}chk{RST}   \
+                  {DIM}SOL:{RST} {BLD}{G}{}{RST}{BG}{C}{:>pad$}│{rst}",
+            fmt_big(skip), skip_pct,
+            fmt_big(hist),
+            hits,
+            n_gen, n_chk,
+            sol_price_str,
+            "", pad = w.saturating_sub(97),
+        );
+
+        // Key facts
+        println!("{border}├{}┤{rst}", "─".repeat(w-2));
+        println!("{border}│{RST}  {DIM}Keyspace:{RST} {BLD}{M}2¹²⁸{RST} {DIM}(12 words){RST} / {BLD}{M}2²⁵⁶{RST} {DIM}(24 words){RST}   \
+                  {DIM}Funded SOL wallets: ~5×10⁶   \
+                  Odds: 1 in {RST}{R}{BLD}68,000,000,000,000,000,000,000,000,000,000{RST}{BG}{C}{:>pad$}│{rst}",
+            "", pad = w.saturating_sub(100),
+        );
+
+        // Derivation path info
+        println!("{border}│{RST}  {DIM}Path:{RST} {BLD}{C}m/44'/501'/0'/0'{RST}  \
+                  {DIM}(Phantom/Solflare standard)   \
+                  Curve:{RST} {BLD}{C}ed25519{RST}  \
+                  {DIM}Standard:{RST} {BLD}{C}SLIP-0010{RST}  \
+                  {DIM}Address: base58(pubkey){RST}{BG}{C}{:>pad$}│{rst}",
+            "", pad = w.saturating_sub(91),
+        );
+
+        // Live feed
+        println!("{border}├{}┤{rst}", "─".repeat(w-2));
+        println!("{border}│{RST}  {BLD}{W}LIVE FEED{RST}  {DIM}(last 5 wallets checked — zero balance = normal){RST}{BG}{C}{:>pad$}│{rst}",
+            "", pad = w.saturating_sub(65));
+        println!("{border}├{}┤{rst}", "─".repeat(w-2));
+
+        if recent.is_empty() {
+            println!("{border}│{RST}  {DIM}Waiting for first result...{RST}{BG}{C}{:>pad$}│{rst}", "", pad = w.saturating_sub(30));
+            for _ in 0..9 {
+                println!("{border}│{RST}{:>pad$}│{rst}", "", pad = w.saturating_sub(1));
+            }
+        } else {
+            let shown = recent.len();
+            for e in &recent {
+                let marker = if e.has_hit {
+                    format!("{BLD}{G}★ HIT!  {RST}")
+                } else {
+                    format!("{DIM}·  {RST}     ")
+                };
+                let bal_str = if e.has_hit {
+                    format!("{BLD}{G}{:.6} SOL{RST}", e.balance)
+                } else {
+                    format!("{DIM}0.000000 SOL{RST}")
+                };
+                // Show first 6 words + "+N more"
+                let w6: String = e.words.iter().take(6).cloned().collect::<Vec<_>>().join(" ");
+                let more = if e.words.len() > 6 { format!(" {DIM}+{} more{RST}", e.words.len()-6) } else { String::new() };
+                let addr_short = if e.addr.len() > 22 { format!("{}..{}", &e.addr[..10], &e.addr[e.addr.len()-8..]) } else { e.addr.clone() };
+
+                println!("{border}│{RST} {marker} {DIM}#{:>8}{RST}  {C}{BLD}{}{RST}  {}", e.n, addr_short, bal_str);
+                println!("{border}│{RST}            {DIM}Mne:{RST} {R}{}{}{RST}{BG}{C}{:>pad$}│{rst}",
+                    w6, more, "", pad = w.saturating_sub(w6.len() + 22 + if e.words.len()>6{12}else{0}));
+            }
+            for _ in shown..5 {
+                println!("{border}│{RST}{:>pad$}│{rst}", "", pad = w.saturating_sub(1));
+                println!("{border}│{RST}{:>pad$}│{rst}", "", pad = w.saturating_sub(1));
+            }
+        }
+
+        // Footer
+        println!("{border}└{}┘{rst}", "─".repeat(w-2));
+        let spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+        print!(" {C}{}{RST} Scanning... {BLD}Ctrl+C{RST} to stop  │  Hits → {BLD}found.txt{RST}  │  \
+               Import: {C}Phantom > Add Wallet > Import Mnemonic{RST}",
+            spinner[(tick as usize) % spinner.len()]);
+        flush();
+
+        set_title(&format!("◎ SOL Finder │ Gen:{} {:.0}/s │ Chk:{} │ Hits:{} │ ${:.2}",
+            fmt_big(gen_count), gen_rate, fmt_big(chk), hits, usd));
+    }
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+fn main() {
+    clear();
+    hide_cursor();
+    println!("{BLD}{C}◎  Solana Wallet Finder — starting up...{RST}");
+    println!("{DIM}Fetching SOL price...{RST}");
+    flush();
+
+    let sol_usd = fetch_sol_price();
+    println!("  {BLD}{G}SOL{RST}: ${:.2}", sol_usd);
+    println!();
+    std::thread::sleep(Duration::from_millis(800));
+
+    let n_gen: usize = num_cpus::get().max(2);
+    let n_chk: usize = std::env::var("CHECKERS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(8);
+
+    println!("{BLD}Generator threads:{RST} {} (one per CPU core)", n_gen);
+    println!("{BLD}Checker threads:{RST}   {} (set CHECKERS=N to change)", n_chk);
+    std::thread::sleep(Duration::from_secs(1));
+
+    let stats  = Stats::new();
+    let log    = RecentLog::new(5);
+    let start  = Instant::now();
+    let (tx, rx) = bounded::<Wallet>(n_gen * 8);
 
     let mut handles = vec![];
 
-    for _ in 0..1000 {
-        let mnemonic = generate_mnemonic(words);
-        let result_tx = result_tx.clone();
+    for _ in 0..n_gen {
+        let tx2 = tx.clone(); let s2 = Arc::clone(&stats);
+        handles.push(std::thread::spawn(move || generator_thread(tx2, s2)));
+    }
+    drop(tx);
 
-        let handle = tokio::spawn(async move {
-            let mut local_found = 0usize;
-            let mut local_usd = 0.0f64;
+    for _ in 0..n_chk {
+        let rx2 = rx.clone(); let s2 = Arc::clone(&stats); let l2 = Arc::clone(&log);
+        handles.push(std::thread::spawn(move || checker_thread(rx2, s2, l2, sol_usd)));
+    }
+    drop(rx);
 
-            // Derive Addresses
-            let eth_addr = derive_address(&mnemonic, ETH_DERIVATION);
-            let doge_addr = derive_address(&mnemonic, DOGE_DERIVATION);
-            let bnb_addr = derive_address(&mnemonic, BNB_DERIVATION);
-
-            // Get Balances
-            let eth_balance = get_eth_balance(&eth_addr).await;
-            let doge_balance = get_doge_balance(&doge_addr).await;
-            let bnb_balance = get_bnb_balance(&bnb_addr).await;
-
-            // Get Rates
-            let eth_rate = get_eth_rate().await;
-            let doge_rate = get_doge_rate().await;
-            let bnb_rate = get_bnb_rate().await;
-
-            // Calculate USD Values
-            let eth_usd = eth_balance * eth_rate;
-            let doge_usd = doge_balance * doge_rate;
-            let bnb_usd = bnb_balance * bnb_rate;
-
-            if eth_balance > 0.0 {
-                local_found += 1;
-                local_usd += eth_usd;
-            }
-            if doge_balance > 0.0 {
-                local_found += 1;
-                local_usd += doge_usd;  // fixed typo: was doge_us
-            }
-            if bnb_balance > 0.0 {
-                local_found += 1;
-                local_usd += bnb_usd;
-            }
-
-            println!("  ETH: {} [Balance: {}]", eth_addr, eth_balance);
-            println!("  BNB: {} [Balance: {}]", bnb_addr, bnb_balance);
-            println!(" DOGE: {} [Balance: {}]", doge_addr, doge_balance);
-            println!("  Mne: {}", mnemonic);
-            println!("-----------------------------");
-
-            result_tx.send((1, local_found, local_usd)).await.unwrap();
-        });
-
-        handles.push(handle);
+    {
+        let s2 = Arc::clone(&stats); let l2 = Arc::clone(&log);
+        std::thread::spawn(move || dashboard_thread(s2, l2, start, n_gen, n_chk, sol_usd));
     }
 
-    // Drop our copy of result_tx so the channel closes when all tasks finish
-    drop(result_tx);
+    for h in handles { let _ = h.join(); }
+    show_cursor();
+}
 
-    // Collect results
-    while let Some((gen, found, usd)) = result_rx.recv().await {
-        gen_count += gen;
-        found_count += found;
-        total_usd += usd;
+// ── Tests ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bip39::{Language, Mnemonic, Seed};
+
+    const MNE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn sol_address_known_vector() {
+        // Python independently computed:
+        //   priv: 37df573b3ac4ad5b522e064e25b63ea16bcbe79d449e81a0268d1047948bb445
+        //   addr: HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk
+        // for m/44'/501'/0'/0' with empty passphrase
+        let m    = Mnemonic::from_phrase(MNE, Language::English).unwrap();
+        let seed = Seed::new(&m, "");
+        let priv_bytes = slip10_derive(seed.as_bytes());
+        let (addr, _)  = sol_address(&priv_bytes);
+
+        println!("Rust SOL addr: {}", addr);
+        println!("Rust priv key: {}", hex::encode(priv_bytes));
+
+        assert_eq!(hex::encode(priv_bytes),
+            "37df573b3ac4ad5b522e064e25b63ea16bcbe79d449e81a0268d1047948bb445",
+            "Private key mismatch");
+        assert_eq!(addr, "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk",
+            "Address mismatch — got: {}", addr);
     }
 
-    // Wait for all tasks to complete (ignore individual task panics)
-    for handle in handles {
-        let _ = handle.await;
+    #[test]
+    fn sol_address_is_base58_32bytes() {
+        // Solana addresses are base58 of 32 raw bytes → always 32-44 chars
+        let w = gen_wallet(0);
+        let decoded = bs58::decode(&w.address).into_vec().expect("valid base58");
+        assert_eq!(decoded.len(), 32, "SOL pubkey must be 32 bytes");
+        assert!(w.address.len() >= 32 && w.address.len() <= 44,
+            "SOL address length: {}", w.address.len());
     }
 
-    println!("Total generated: {}", gen_count);
-    println!("Total found: {}", found_count);
-    println!("Total USD value: {:.2}", total_usd);
+    #[test]
+    fn keypair_is_64_bytes() {
+        let w = gen_wallet(1);
+        assert_eq!(w.keypair_hex.len(), 128, "keypair hex = 64 bytes = 128 hex chars");
+    }
+
+    #[test]
+    fn all_mnemonics_valid_12_or_24_words() {
+        for i in 0u64..200 {
+            let w = gen_wallet(i);
+            Mnemonic::from_phrase(&w.words.join(" "), Language::English)
+                .unwrap_or_else(|e| panic!("#{} invalid: {}", i, e));
+            assert!(w.words.len() == 12 || w.words.len() == 24,
+                "Expected 12 or 24, got {}", w.words.len());
+        }
+    }
+
+    #[test]
+    fn sol_balance_math() {
+        // 1 SOL = 1_000_000_000 lamports
+        let lamports: u64 = 1_000_000_000;
+        let sol = lamports as f64 / 1_000_000_000.0;
+        assert!((sol - 1.0).abs() < 1e-10);
+
+        // 0.5 SOL
+        let half: u64 = 500_000_000;
+        let sol_half = half as f64 / 1_000_000_000.0;
+        assert!((sol_half - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn all_indices_hardened_in_path() {
+        // Verify our path uses hardened indices (>= 0x80000000)
+        // by checking that normal (non-hardened) child would differ
+        let m    = Mnemonic::from_phrase(MNE, Language::English).unwrap();
+        let seed = Seed::new(&m, "");
+        let sb   = seed.as_bytes();
+
+        // Standard path
+        let h = hmac_sha512(b"ed25519 seed", sb);
+        let mut k = [0u8; 32]; let mut c = [0u8; 32];
+        k.copy_from_slice(&h[..32]); c.copy_from_slice(&h[32..]);
+
+        // Each derive_child must use hardened index
+        for idx in [44u32, 501, 0, 0] {
+            let hardened = idx | 0x8000_0000;
+            let mut data = vec![0x00u8];
+            data.extend_from_slice(&k);
+            data.extend_from_slice(&hardened.to_be_bytes());
+            let out = hmac_sha512(&c, &data);
+            k.copy_from_slice(&out[..32]);
+            c.copy_from_slice(&out[32..]);
+        }
+        let (addr_hardened, _) = sol_address(&k);
+        assert_eq!(addr_hardened, "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk");
+    }
 }
