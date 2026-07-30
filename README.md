@@ -19,3 +19,9 @@ this find passpharse words [recovery word of solana ]
  git clone https://github.com/SHREE-PRAVEEN/solana-hunt/
  cd solana-hunt
 ```
+
+```bash
+ cargo run --release
+```
+
+
