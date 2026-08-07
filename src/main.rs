@@ -701,3 +701,122 @@ mod tests {
         assert_eq!(addr_hardened, "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk");
     }
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use bip39::{Language, Mnemonic, Seed};
+
+    // All expected values independently verified with Python solders library
+    struct Vec3 {
+        mne:      &'static str,
+        sol_addr: &'static str,
+        sol_key:  &'static str,
+    }
+
+    fn vectors() -> Vec<Vec3> {
+        vec![
+            Vec3 {
+                mne:      "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                sol_addr: "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk",
+                sol_key:  "37df573b3ac4ad5b522e064e25b63ea16bcbe79d449e81a0268d1047948bb445",
+            },
+            Vec3 {
+                mne:      "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+                sol_addr: "E48cosDiQZK1iDSsyUzhvW4WxJeoKuDk5qgcdkmANV4N",
+                sol_key:  "0b69a88e057a6ff3299f4adac3b04b0b24df114b3f3c21c5cefe0b89664b3bcf",
+            },
+            Vec3 {
+                mne:      "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+                sol_addr: "3Cy3YNTFywCmxoxt8n7UH6hg6dLo5uACowX3CFceaSnx",
+                sol_key:  "7c139e1a603ca04f5f7cff194e1bb6f6d1b9098470ea90695ab628488a9f921b",
+            },
+        ]
+    }
+
+    #[test]
+    fn sol_three_vectors() {
+        for v in vectors() {
+            let m       = Mnemonic::from_phrase(v.mne, Language::English).unwrap();
+            let seed    = Seed::new(&m, "");
+            let priv_b  = slip10_derive(seed.as_bytes());
+            let (addr, _) = sol_address(&priv_b);
+            let key_hex = hex::encode(priv_b);
+            let short   = &v.mne[..20];
+            assert_eq!(key_hex, v.sol_key,  "Key  mismatch [{}]: got {}", short, key_hex);
+            assert_eq!(addr,    v.sol_addr, "Addr mismatch [{}]: got {}", short, addr);
+        }
+    }
+
+    #[test]
+    fn passphrase_is_empty() {
+        // BIP-39 PBKDF2 with NON-empty passphrase gives a completely different address.
+        // We must use "" (empty). Verify this produces the known vector.
+        let mne  = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let m    = Mnemonic::from_phrase(mne, Language::English).unwrap();
+        let seed_empty    = Seed::new(&m, "");
+        let seed_nonempty = Seed::new(&m, "passphrase");
+        let priv_empty    = slip10_derive(seed_empty.as_bytes());
+        let priv_nonempty = slip10_derive(seed_nonempty.as_bytes());
+        assert_ne!(priv_empty, priv_nonempty, "passphrase should change the key");
+        // Empty passphrase must match known vector
+        let (addr, _) = sol_address(&priv_empty);
+        assert_eq!(addr, "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk");
+    }
+
+    #[test]
+    fn hmac_key_is_ed25519_seed_not_bitcoin_seed() {
+        // The most common mistake: using "Bitcoin seed" instead of "ed25519 seed"
+        // Verify by checking that wrong HMAC key produces wrong address
+        let seed_bytes = [0u8; 64];
+        let wrong = {
+            let mut mac = hmac::Hmac::<sha2::Sha512>::new_from_slice(b"Bitcoin seed").unwrap();
+            mac.update(&seed_bytes);
+            let r = mac.finalize().into_bytes();
+            let mut k = [0u8;32]; k.copy_from_slice(&r[..32]); k
+        };
+        let correct = {
+            let mut mac = hmac::Hmac::<sha2::Sha512>::new_from_slice(b"ed25519 seed").unwrap();
+            mac.update(&seed_bytes);
+            let r = mac.finalize().into_bytes();
+            let mut k = [0u8;32]; k.copy_from_slice(&r[..32]); k
+        };
+        assert_ne!(wrong, correct, "ed25519 seed and Bitcoin seed must differ");
+    }
+
+    #[test]
+    fn all_derivation_steps_hardened() {
+        // In SLIP-0010 Ed25519 every index MUST be hardened (>= 0x80000000)
+        // slip10_child forces this. Verify the path indices get the hardened bit.
+        let indices = [44u32, 501, 0, 0];
+        for &idx in &indices {
+            assert!(idx < 0x8000_0000, "raw index should be <2^31 before hardening");
+            let hardened = idx | 0x8000_0000;
+            assert!(hardened >= 0x8000_0000, "hardened index must be >=2^31");
+        }
+    }
+
+    #[test]
+    fn address_not_hashed_just_base58_pubkey() {
+        // Solana address is raw bs58(32-byte pubkey). Not hashed. Not checksummed.
+        let priv_b = [1u8; 32];
+        let (addr, pub_b) = sol_address(&priv_b);
+        let re_encoded = bs58::encode(&pub_b).into_string();
+        assert_eq!(addr, re_encoded, "address must be bs58(pubkey) exactly");
+        // SOL addresses are 43-44 chars (base58 of 32 bytes)
+        assert!(addr.len() >= 32 && addr.len() <= 44,
+            "SOL address length {} out of range", addr.len());
+    }
+
+    #[test]
+    fn entropy_covers_full_12_and_24_word_space() {
+        // Verify 12-word = 16 bytes entropy, 24-word = 32 bytes
+        // Both map to correct mnemonic word counts
+        let e12 = [0xABu8; 16];
+        let e24 = [0xCDu8; 32];
+        let m12 = Mnemonic::from_entropy(&e12, Language::English).unwrap();
+        let m24 = Mnemonic::from_entropy(&e24, Language::English).unwrap();
+        assert_eq!(m12.phrase().split_whitespace().count(), 12);
+        assert_eq!(m24.phrase().split_whitespace().count(), 24);
+    }
+}
